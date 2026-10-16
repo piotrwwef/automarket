@@ -1,0 +1,19 @@
+{
+  "schemaVersion": 1,
+  "id": "automarket",
+  "version": "${version}",
+  "name": "AutoRynek",
+  "description": "Automatycznie kupuje tanie przedmioty z rynku (/ah) na EarthSMP CraftCube.",
+  "authors": ["samsamek"],
+  "license": "MIT",
+  "environment": "client",
+  "entrypoints": {
+    "client": ["pl.automarket.AutoMarketMod"]
+  },
+  "depends": {
+    "fabricloader": ">=0.18.0",
+    "minecraft": "~1.21.11",
+    "java": ">=21",
+    "fabric-api": "*"
+  }
+}
