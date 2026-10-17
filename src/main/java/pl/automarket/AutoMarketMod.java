@@ -4,17 +4,20 @@ import com.mojang.brigadier.CommandDispatcher;
 import com.mojang.brigadier.arguments.DoubleArgumentType;
 import com.mojang.brigadier.arguments.IntegerArgumentType;
 import com.mojang.brigadier.arguments.StringArgumentType;
+import com.mojang.brigadier.context.CommandContext;
 import com.mojang.brigadier.tree.LiteralCommandNode;
 import net.fabricmc.api.ClientModInitializer;
-import net.fabricmc.fabric.api.client.command.v2.ClientCommandManager;
 import net.fabricmc.fabric.api.client.command.v2.ClientCommandRegistrationCallback;
 import net.fabricmc.fabric.api.client.command.v2.FabricClientCommandSource;
 import net.fabricmc.fabric.api.client.event.lifecycle.v1.ClientTickEvents;
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.registry.Registries;
 import net.minecraft.screen.GenericContainerScreenHandler;
 import net.minecraft.text.Text;
+import net.minecraft.util.Identifier;
+import org.lwjgl.glfw.GLFW;
 
-import java.util.Map;
+import java.util.Locale;
 
 import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.argument;
 import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.literal;
@@ -22,6 +25,8 @@ import static net.fabricmc.fabric.api.client.command.v2.ClientCommandManager.lit
 public class AutoMarketMod implements ClientModInitializer {
     private static Config config;
     private static Bot bot;
+    private static boolean openGui = false;
+    private static boolean guiWasDown = false;
 
     @Override
     public void onInitializeClient() {
@@ -29,12 +34,30 @@ public class AutoMarketMod implements ClientModInitializer {
         bot = new Bot(config);
         ClientTickEvents.END_CLIENT_TICK.register(bot::tick);
         ClientTickEvents.END_CLIENT_TICK.register(mc -> Picker.tick(mc, config));
+        ClientTickEvents.END_CLIENT_TICK.register(AutoMarketMod::guiTick);
         ClientCommandRegistrationCallback.EVENT.register(
                 (dispatcher, registryAccess) -> registerCommands(dispatcher));
     }
 
-    private static void say(com.mojang.brigadier.context.CommandContext<FabricClientCommandSource> ctx, String s) {
+    /** Otwiera GUI klawiszem (domyslnie prawy Ctrl) albo po komendzie /am gui. */
+    private static void guiTick(MinecraftClient mc) {
+        if (mc.player == null) return;
+        boolean down = GLFW.glfwGetKey(mc.getWindow().getHandle(), config.guiKey) == GLFW.GLFW_PRESS;
+        if (mc.currentScreen == null && ((down && !guiWasDown) || openGui)) {
+            openGui = false;
+            mc.setScreen(new MainScreen(config, bot));
+        }
+        guiWasDown = down;
+    }
+
+    private static void say(CommandContext<FabricClientCommandSource> ctx, String s) {
         ctx.getSource().sendFeedback(Text.literal("[AutoRynek] " + s));
+    }
+
+    private static String stripQuotes(String s) {
+        s = s.trim();
+        if (s.length() >= 2 && s.startsWith("\"") && s.endsWith("\"")) s = s.substring(1, s.length() - 1);
+        return s.trim();
     }
 
     private static void registerCommands(CommandDispatcher<FabricClientCommandSource> dispatcher) {
@@ -52,33 +75,94 @@ public class AutoMarketMod implements ClientModInitializer {
                             say(ctx, bot.status());
                             return 1;
                         }))
+                        .then(literal("gui").executes(ctx -> {
+                            openGui = true;
+                            return 1;
+                        }))
+                        // /am add <nazwa lub id przedmiotu> <cena: 50000 / 50k / 1.5m>
                         .then(literal("add")
-                                .then(argument("klucz", StringArgumentType.string())
-                                        .then(argument("cena", DoubleArgumentType.doubleArg(0))
-                                                .executes(ctx -> {
-                                                    String k = StringArgumentType.getString(ctx, "klucz");
-                                                    double c = DoubleArgumentType.getDouble(ctx, "cena");
-                                                    config.rules.put(k, c);
-                                                    config.save();
-                                                    say(ctx, "Regula: " + k + " <= $" + Bot.fmt(c) + " za sztuke");
-                                                    return 1;
-                                                }))))
-                        .then(literal("remove")
-                                .then(argument("klucz", StringArgumentType.string()).executes(ctx -> {
-                                    String k = StringArgumentType.getString(ctx, "klucz");
-                                    boolean removed = config.rules.remove(k) != null;
+                                .then(argument("tekst", StringArgumentType.greedyString()).executes(ctx -> {
+                                    String t = StringArgumentType.getString(ctx, "tekst").trim();
+                                    int sp = t.lastIndexOf(' ');
+                                    if (sp <= 0) {
+                                        say(ctx, "Uzycie: /am add <nazwa> <cena>, np. /am add ender_pearl 500");
+                                        return 0;
+                                    }
+                                    String k = stripQuotes(t.substring(0, sp));
+                                    Double c = Listing.parseMoney(t.substring(sp + 1));
+                                    if (c == null || k.isEmpty()) {
+                                        say(ctx, "Nie rozumiem ceny \"" + t.substring(sp + 1) + "\". Wpisz np. 50000 albo 50k.");
+                                        return 0;
+                                    }
+                                    String id = k.toLowerCase(Locale.ROOT).replace(' ', '_');
+                                    Config.Rule r;
+                                    if (id.equals("all") || id.equals("*")) {
+                                        r = config.find("*", "");
+                                        if (r == null) r = new Config.Rule("*", "", c);
+                                        else config.snipes.remove(r);
+                                    } else if (Registries.ITEM.containsId(Identifier.of("minecraft", id))) {
+                                        r = config.find(id, "");
+                                        if (r != null) config.snipes.remove(r);
+                                        r = new Config.Rule(id, "", c);
+                                    } else {
+                                        r = config.find("*", k);
+                                        if (r != null) config.snipes.remove(r);
+                                        r = new Config.Rule("*", k, c);
+                                    }
+                                    r.max = c;
+                                    config.snipes.add(r);
                                     config.save();
-                                    say(ctx, removed ? "Usunieto: " + k : "Nie ma takiej reguly: " + k);
+                                    say(ctx, "Dodano: " + r.title() + " <= $" + Bot.fmt(c) + " za sztuke");
                                     return 1;
                                 })))
+                        // /am remove <numer z /am list albo nazwa>
+                        .then(literal("remove")
+                                .then(argument("tekst", StringArgumentType.greedyString()).executes(ctx -> {
+                                    String t = stripQuotes(StringArgumentType.getString(ctx, "tekst"));
+                                    Config.Rule found = null;
+                                    try {
+                                        int n = Integer.parseInt(t);
+                                        if (n >= 1 && n <= config.snipes.size()) found = config.snipes.get(n - 1);
+                                    } catch (NumberFormatException ignored) {
+                                        String low = t.toLowerCase(Locale.ROOT);
+                                        int hits = 0;
+                                        for (Config.Rule r : config.snipes) {
+                                            if (r.title().toLowerCase(Locale.ROOT).contains(low)) {
+                                                found = r;
+                                                hits++;
+                                            }
+                                        }
+                                        if (hits > 1) {
+                                            say(ctx, "Pasuje kilka pozycji, uzyj numeru z /am list.");
+                                            return 0;
+                                        }
+                                    }
+                                    if (found == null) {
+                                        say(ctx, "Nie ma takiej pozycji. Sprawdz /am list i uzyj numeru.");
+                                        return 0;
+                                    }
+                                    config.snipes.remove(found);
+                                    config.save();
+                                    say(ctx, "Usunieto: " + found.title());
+                                    return 1;
+                                })))
+                        .then(literal("clear").executes(ctx -> {
+                            int n = config.snipes.size();
+                            config.snipes.clear();
+                            config.save();
+                            say(ctx, "Wyczyszczono liste (" + n + " pozycji).");
+                            return 1;
+                        }))
                         .then(literal("list").executes(ctx -> {
-                            if (config.rules.isEmpty()) say(ctx, "Brak regul.");
-                            for (Map.Entry<String, Double> e : config.rules.entrySet()) {
-                                say(ctx, e.getKey() + " <= $" + Bot.fmt(e.getValue()) + " / szt.");
+                            if (config.snipes.isEmpty()) say(ctx, "Lista jest pusta.");
+                            int num = 0;
+                            for (Config.Rule r : config.snipes) {
+                                say(ctx, (++num) + ". " + r.title() + " <= $" + Bot.fmt(r.max) + " / szt."
+                                        + (r.on ? "" : " (wylaczone)"));
                             }
                             say(ctx, "budzet: " + (config.budget > 0 ? "$" + Bot.fmt(config.budget) : "bez limitu")
-                                    + ", opoznienie: " + config.clickDelay + " ticków, odswiezanie: " + config.refreshTicks
-                                    + " ticków, komenda: /" + config.command);
+                                    + ", klikanie: " + config.clickDelay + " ticków, odswiezanie: " + config.refreshTicks
+                                    + " ticków, komenda: /" + config.command + ", sortowanie: " + config.sortMode);
                             return 1;
                         }))
                         .then(literal("budget")
@@ -89,14 +173,14 @@ public class AutoMarketMod implements ClientModInitializer {
                                     return 1;
                                 })))
                         .then(literal("delay")
-                                .then(argument("ticki", IntegerArgumentType.integer(2, 100)).executes(ctx -> {
+                                .then(argument("ticki", IntegerArgumentType.integer(1, 100)).executes(ctx -> {
                                     config.clickDelay = IntegerArgumentType.getInteger(ctx, "ticki");
                                     config.save();
                                     say(ctx, "Opoznienie miedzy kliknieciami: " + config.clickDelay + " ticków");
                                     return 1;
                                 })))
                         .then(literal("refresh")
-                                .then(argument("ticki", IntegerArgumentType.integer(10, 1200)).executes(ctx -> {
+                                .then(argument("ticki", IntegerArgumentType.integer(2, 1200)).executes(ctx -> {
                                     config.refreshTicks = IntegerArgumentType.getInteger(ctx, "ticki");
                                     config.save();
                                     say(ctx, "Odswiezanie rynku co " + config.refreshTicks + " ticków");
@@ -110,11 +194,11 @@ public class AutoMarketMod implements ClientModInitializer {
                                     return 1;
                                 }))
                                 .then(argument("slot", IntegerArgumentType.integer(0, 53))
-                                        .then(argument("nazwa", StringArgumentType.string()).executes(ctx -> {
+                                        .then(argument("tryb", StringArgumentType.greedyString()).executes(ctx -> {
                                             config.sortSlot = IntegerArgumentType.getInteger(ctx, "slot");
-                                            config.sortName = StringArgumentType.getString(ctx, "nazwa");
+                                            config.sortMode = stripQuotes(StringArgumentType.getString(ctx, "tryb"));
                                             config.save();
-                                            say(ctx, "Sortowanie: slot " + config.sortSlot + ", tryb \"" + config.sortName + "\"");
+                                            say(ctx, "Sortowanie: slot " + config.sortSlot + ", tryb \"" + config.sortMode + "\"");
                                             return 1;
                                         }))))
                         .then(literal("cmd")
@@ -139,12 +223,12 @@ public class AutoMarketMod implements ClientModInitializer {
                                             say(ctx, "Nastepna strona: slot " + config.nextPageSlot + ", max stron: " + config.maxPages);
                                             return 1;
                                         }))))
-                        // diagnostyka: wypisuje oferty odczytane z otwartego okna rynku
+                        // diagnostyka: wypisuje oferty odczytane z otwartego okna rynku (dziala tez klawisz D na rynku)
                         .then(literal("scan").executes(ctx -> {
                             MinecraftClient mc = MinecraftClient.getInstance();
                             GenericContainerScreenHandler h = Bot.market(mc);
                             if (h == null) {
-                                say(ctx, "Otworz najpierw rynek (/" + config.command + ").");
+                                say(ctx, "Otworz najpierw rynek (/" + config.command + ") i nacisnij klawisz D.");
                                 return 0;
                             }
                             int n = 0;

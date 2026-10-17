@@ -80,10 +80,12 @@ public class Listing {
         }
     }
 
-    /** Czy klucz reguly pasuje do tej oferty. */
-    public boolean matches(String key) {
-        String k = key.toLowerCase(Locale.ROOT);
-        if (k.equals("all")) return true;
-        return itemId.contains(k) || name.toLowerCase(Locale.ROOT).contains(k);
+    /** Czy pozycja z listy snajpowania pasuje do tej oferty. */
+    public boolean matches(Config.Rule r) {
+        if (!r.on) return false;
+        boolean itemOk = r.item == null || r.item.isEmpty() || r.item.equals("*") || r.item.equals(itemId);
+        boolean nameOk = r.name == null || r.name.isEmpty()
+                || name.toLowerCase(Locale.ROOT).contains(r.name.toLowerCase(Locale.ROOT));
+        return itemOk && nameOk;
     }
 }

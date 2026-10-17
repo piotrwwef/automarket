@@ -1,20 +1,19 @@
 package pl.automarket;
 
 import net.minecraft.client.MinecraftClient;
+import net.minecraft.client.gui.screen.ingame.GenericContainerScreen;
 import net.minecraft.component.DataComponentTypes;
 import net.minecraft.component.type.LoreComponent;
-import net.minecraft.text.Style;
-import java.util.Locale;
-import java.util.Optional;
-import net.minecraft.client.gui.screen.ingame.GenericContainerScreen;
 import net.minecraft.item.ItemStack;
 import net.minecraft.registry.Registries;
 import net.minecraft.screen.GenericContainerScreenHandler;
 import net.minecraft.screen.slot.SlotActionType;
+import net.minecraft.text.Style;
 import net.minecraft.text.Text;
 import net.minecraft.util.Formatting;
 
-import java.util.Map;
+import java.util.Locale;
+import java.util.Optional;
 
 public class Bot {
     private enum State { OFF, OPEN, WAIT_MARKET, SCAN, WAIT_CONFIRM, COOLDOWN }
@@ -25,6 +24,7 @@ public class Bot {
     private int timeout = 0;
     private int page = 0;
     private int sortAttempts = 0;
+    private int lastSync = -1;
 
     private double pendingPrice = 0;
     private String pendingName = "";
@@ -41,8 +41,12 @@ public class Bot {
     }
 
     public void start(MinecraftClient mc) {
-        if (cfg.rules.isEmpty()) {
-            msg(mc, "Najpierw dodaj regule: /automarket add <przedmiot|all> <max cena za sztuke>", Formatting.RED);
+        boolean any = false;
+        for (Config.Rule r : cfg.snipes) {
+            if (r.on && r.max > 0) any = true;
+        }
+        if (!any) {
+            msg(mc, "Dodaj przedmioty do snajpienia (GUI: prawy Ctrl) i ustaw cene wieksza od 0.", Formatting.RED);
             return;
         }
         bought = 0;
@@ -50,7 +54,7 @@ public class Bot {
         page = 0;
         wait = 0;
         state = State.OPEN;
-        msg(mc, "Wlaczono. Zatrzymanie: /automarket stop", Formatting.GREEN);
+        msg(mc, "Wlaczono. Zatrzymanie: /am stop (albo przycisk Stop w GUI).", Formatting.GREEN);
     }
 
     public void stop(MinecraftClient mc, String reason) {
@@ -66,6 +70,8 @@ public class Bot {
 
     public void tick(MinecraftClient mc) {
         if (state == State.OFF) return;
+        // gdy uzytkownik ma otwarte GUI moda, bot czeka
+        if (mc.currentScreen instanceof MainScreen || mc.currentScreen instanceof PickerScreen) return;
         if (mc.player == null || mc.interactionManager == null || mc.getNetworkHandler() == null) {
             state = State.OFF;
             return;
@@ -77,16 +83,20 @@ public class Bot {
 
         switch (state) {
             case OPEN -> {
+                // nie zamykamy starego okna rynku: zapamietujemy jego id i czekamy na nowe
+                GenericContainerScreenHandler cur = market(mc);
+                lastSync = cur == null ? -1 : cur.syncId;
                 mc.player.networkHandler.sendChatCommand(cfg.command);
                 state = State.WAIT_MARKET;
                 timeout = 60;
             }
             case WAIT_MARKET -> {
-                if (market(mc) != null) {
+                GenericContainerScreenHandler h = market(mc);
+                if (h != null && h.syncId != lastSync && loaded(h)) {
                     page = 0;
                     sortAttempts = 0;
                     state = State.SCAN;
-                    wait = cfg.clickDelay;
+                    scan(mc); // skanuje od razu w tym samym ticku, bez dodatkowego czekania
                 } else if (--timeout <= 0) {
                     state = State.OPEN;
                     wait = cfg.refreshTicks;
@@ -94,7 +104,7 @@ public class Bot {
             }
             case SCAN -> scan(mc);
             case WAIT_CONFIRM -> confirm(mc);
-            case COOLDOWN -> state = (market(mc) != null) ? State.SCAN : State.OPEN;
+            case COOLDOWN -> state = State.OPEN;
             default -> {
             }
         }
@@ -110,12 +120,12 @@ public class Bot {
             return;
         }
 
-        // ustaw sortowanie (np. "Najtansze"), jesli przycisk jest i tryb nie jest jeszcze wybrany
+        // ustaw sortowanie (np. "Najnowsze"), jesli przycisk jest i tryb nie jest jeszcze wybrany
         if (cfg.sortSlot >= 0 && cfg.sortSlot < h.getRows() * 9 && sortAttempts < 4
-                && cfg.sortName != null && !cfg.sortName.isEmpty()) {
+                && cfg.sortMode != null && !cfg.sortMode.isEmpty()) {
             LoreComponent lore = h.getSlot(cfg.sortSlot).getStack().get(DataComponentTypes.LORE);
             if (lore != null) {
-                String want = cfg.sortName.toLowerCase(Locale.ROOT);
+                String want = cfg.sortMode.toLowerCase(Locale.ROOT);
                 boolean found = false;
                 boolean selected = false;
                 for (Text line : lore.lines()) {
@@ -127,7 +137,7 @@ public class Bot {
                 if (found && !selected) {
                     mc.interactionManager.clickSlot(h.syncId, cfg.sortSlot, 1, SlotActionType.PICKUP, mc.player);
                     sortAttempts++;
-                    wait = cfg.clickDelay * 2;
+                    wait = Math.max(6, cfg.clickDelay * 2); // serwer musi zdazyc odswiezyc przycisk sortowania
                     return;
                 }
             }
@@ -157,9 +167,8 @@ public class Bot {
             pendingPrice = bestListing.price;
             pendingName = bestListing.count + "x " + bestListing.name;
             click(mc, h, best);
-            state = State.WAIT_CONFIRM; // czekamy na okno potwierdzenia
+            state = State.WAIT_CONFIRM; // czekamy na okno potwierdzenia (sprawdzamy co tick)
             timeout = 40;
-            wait = cfg.clickDelay;
             return;
         }
 
@@ -170,10 +179,18 @@ public class Bot {
             return;
         }
 
-        // nic nie znaleziono -> zamknij i otworz rynek od nowa
-        mc.player.closeHandledScreen();
+        // nic nie znaleziono -> po chwili otworz rynek od nowa (automatyczne odswiezanie)
         state = State.OPEN;
         wait = cfg.refreshTicks;
+    }
+
+    /** Okno ma juz zawartosc od serwera (pakiet z przedmiotami przychodzi zaraz po otwarciu). */
+    private static boolean loaded(GenericContainerScreenHandler h) {
+        int size = h.getRows() * 9;
+        for (int i = 0; i < size; i++) {
+            if (!h.getSlot(i).getStack().isEmpty()) return true;
+        }
+        return false;
     }
 
     /** Wybrana opcja w tooltipie sortowania jest podkreslona. */
@@ -188,10 +205,9 @@ public class Bot {
 
     private Double maxUnitFor(Listing l) {
         Double best = null;
-        for (Map.Entry<String, Double> e : cfg.rules.entrySet()) {
-            if (l.matches(e.getKey())) {
-                if (best == null || e.getValue() > best) best = e.getValue();
-            }
+        for (Config.Rule r : cfg.snipes) {
+            if (r.max <= 0 || !l.matches(r)) continue;
+            if (best == null || r.max > best) best = r.max;
         }
         return best;
     }
@@ -201,7 +217,7 @@ public class Bot {
     private void confirm(MinecraftClient mc) {
         if (mc.currentScreen instanceof GenericContainerScreen s && s.getScreenHandler().getRows() == 3) {
             GenericContainerScreenHandler h = s.getScreenHandler();
-            int ok = 11; // domyslnie zielone pole z zrzutu ekranu
+            int ok = 11; // domyslnie zielone pole ze zrzutu ekranu
             for (int i = 0; i < 27; i++) {
                 ItemStack st = h.getSlot(i).getStack();
                 if (st.isEmpty()) continue;
@@ -221,13 +237,13 @@ public class Bot {
                 return;
             }
             state = State.COOLDOWN;
-            wait = cfg.clickDelay * 3;
+            wait = 2;
             return;
         }
         if (--timeout <= 0) {
             // okno potwierdzenia sie nie pojawilo
             state = State.COOLDOWN;
-            wait = cfg.clickDelay * 2;
+            wait = 2;
         }
     }
 
